@@ -80,6 +80,15 @@ impl BamBoostCliHandler {
                 };
                 self.status(network, claimant).await
             }
+            BamBoostCommands::MerkleDistributor {
+                action: MerkleDistributorActions::ClaimAll { network, yes },
+            } => {
+                let network = match network {
+                    NetworkArg::Mainnet => "mainnet",
+                    NetworkArg::Testnet => "testnet",
+                };
+                self.claim_all(network, yes).await
+            }
             BamBoostCommands::ClaimStatus {
                 action: ClaimStatusActions::Get { epoch, claimant },
             } => self.get_claim_status(epoch, claimant),
@@ -212,6 +221,95 @@ impl BamBoostCliHandler {
 
         println!("{}", serde_json::to_string_pretty(&account)?);
 
+        Ok(())
+    }
+
+    async fn claim_all(&self, network: &str, yes: bool) -> anyhow::Result<()> {
+        let signer = self
+            .cli_config
+            .signer
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("signer is required"))?;
+        let claimant = signer.pubkey();
+
+        let scanner = crate::scanner::Scanner::new(default_cache_dir());
+        let rpc_client = self.get_rpc_client();
+        let statuses = scanner
+            .scan(network, &claimant, &rpc_client, &self.bam_boost_program_id)
+            .await?;
+
+        let unclaimed: Vec<_> = statuses
+            .iter()
+            .filter(|s| s.amount.is_some() && !s.claimed)
+            .collect();
+        if unclaimed.is_empty() {
+            println!("Nothing to claim: no unclaimed epochs for {claimant}");
+            return Ok(());
+        }
+
+        let total: u64 = unclaimed.iter().filter_map(|s| s.amount).sum();
+        println!("Unclaimed epochs for {claimant}:");
+        for s in &unclaimed {
+            println!(
+                "  epoch {:>6}: {} JitoSOL",
+                s.epoch,
+                format_jitosol(s.amount.unwrap_or(0))
+            );
+        }
+        println!(
+            "Total: {} JitoSOL across {} epoch(s)",
+            format_jitosol(total),
+            unclaimed.len()
+        );
+
+        if !yes {
+            print!("Proceed with claiming? [y/N] ");
+            use std::io::Write as _;
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("Aborted.");
+                return Ok(());
+            }
+        }
+
+        let epochs: Vec<u64> = unclaimed.iter().map(|s| s.epoch).collect();
+        let results = crate::batch_claim::claim_epochs(
+            &scanner,
+            &self.cli_config,
+            &self.bam_boost_program_id,
+            network,
+            &epochs,
+            &mut |event| match &event.state {
+                crate::batch_claim::ClaimState::Started => {
+                    println!("epoch {}: claiming...", event.epoch)
+                }
+                crate::batch_claim::ClaimState::Success(sig) => {
+                    println!("epoch {}: OK  {sig}", event.epoch)
+                }
+                crate::batch_claim::ClaimState::Failed(e) => {
+                    println!("epoch {}: FAILED  {e}", event.epoch)
+                }
+                crate::batch_claim::ClaimState::Skipped(r) => {
+                    println!("epoch {}: skipped  {r}", event.epoch)
+                }
+            },
+        )
+        .await?;
+
+        let ok = results
+            .iter()
+            .filter(|r| matches!(r.state, crate::batch_claim::ClaimState::Success(_)))
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| matches!(r.state, crate::batch_claim::ClaimState::Failed(_)))
+            .count();
+        println!(
+            "\nDone: {ok} claimed, {failed} failed, {} other",
+            results.len() - ok - failed
+        );
         Ok(())
     }
 
