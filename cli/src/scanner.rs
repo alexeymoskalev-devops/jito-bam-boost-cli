@@ -1,7 +1,12 @@
+use jito_bam_boost_merkle_tree::bam_boost_entry::BamBoostEntry;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const DEFAULT_GCS_BASE: &str = "https://storage.googleapis.com";
+
+const RETRY_ATTEMPTS: u32 = 3;
+const RETRY_BASE_DELAY_MS: u64 = 300;
 
 /// Discovers BAM Boost epochs, allocations, and claim statuses.
 pub struct Scanner {
@@ -56,6 +61,53 @@ impl Scanner {
         }
         epochs.sort_unstable();
         Ok(epochs)
+    }
+
+    /// Downloads (or reads from cache) the entry list for an epoch.
+    /// Returns `None` when no distribution exists for that epoch (HTTP 404).
+    pub async fn fetch_entries(
+        &self,
+        network: &str,
+        epoch: u64,
+    ) -> anyhow::Result<Option<Vec<BamBoostEntry>>> {
+        let cache_path = self.cache_dir.join(network).join(format!("{epoch}.json"));
+        if let Ok(raw) = std::fs::read_to_string(&cache_path) {
+            return Ok(Some(serde_json::from_str(&raw)?));
+        }
+
+        let url = format!(
+            "{}/jito-bam-boost/{network}/{epoch}/merkle_tree.json",
+            self.base_url
+        );
+
+        let mut delay = Duration::from_millis(RETRY_BASE_DELAY_MS);
+        for attempt in 1..=RETRY_ATTEMPTS {
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status() == reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => {
+                        let raw = resp.text().await?;
+                        let entries: Vec<BamBoostEntry> = serde_json::from_str(&raw)?;
+                        if let Some(parent) = cache_path.parent() {
+                            std::fs::create_dir_all(parent)?;
+                        }
+                        std::fs::write(&cache_path, &raw)?;
+                        return Ok(Some(entries));
+                    }
+                    Err(e) if attempt < RETRY_ATTEMPTS => {
+                        log::warn!("fetch epoch {epoch} attempt {attempt} failed: {e}");
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+                Err(e) if attempt < RETRY_ATTEMPTS => {
+                    log::warn!("fetch epoch {epoch} attempt {attempt} failed: {e}");
+                }
+                Err(e) => return Err(e.into()),
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
+        unreachable!("retry loop always returns")
     }
 }
 
@@ -154,5 +206,61 @@ mod tests {
         page1.assert();
         page2.assert();
         assert_eq!(epochs, vec![998, 999, 1000]);
+    }
+
+    fn entries_json() -> serde_json::Value {
+        serde_json::json!([
+            {"pubkey": "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn", "amount": 1234}
+        ])
+    }
+
+    #[tokio::test]
+    async fn fetches_entries_and_caches_them() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("GET")
+                .path("/jito-bam-boost/mainnet/7/merkle_tree.json");
+            then.status(200).json_body(entries_json());
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = Scanner::with_base_url(server.base_url(), tmp.path().to_path_buf());
+
+        let first = scanner.fetch_entries("mainnet", 7).await.unwrap().unwrap();
+        let second = scanner.fetch_entries("mainnet", 7).await.unwrap().unwrap();
+
+        mock.assert_hits(1); // second call served from cache
+        assert_eq!(first[0].amount, 1234);
+        assert_eq!(first, second);
+        assert!(tmp.path().join("mainnet/7.json").exists());
+    }
+
+    #[tokio::test]
+    async fn returns_none_on_404() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method("GET")
+                .path("/jito-bam-boost/mainnet/8/merkle_tree.json");
+            then.status(404);
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = Scanner::with_base_url(server.base_url(), tmp.path().to_path_buf());
+        assert!(scanner.fetch_entries("mainnet", 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn retries_transient_errors() {
+        let server = httpmock::MockServer::start();
+        // httpmock serves mocks in order of creation once exhausted; emulate
+        // one 500 then success via hit-limited mock.
+        let failing = server.mock(|when, then| {
+            when.method("GET")
+                .path("/jito-bam-boost/mainnet/9/merkle_tree.json");
+            then.status(500);
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = Scanner::with_base_url(server.base_url(), tmp.path().to_path_buf());
+        let err = scanner.fetch_entries("mainnet", 9).await;
+        assert!(err.is_err());
+        failing.assert_hits(3); // 3 attempts total
     }
 }
