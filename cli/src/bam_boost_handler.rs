@@ -14,7 +14,7 @@ use spl_associated_token_account_interface::{
 use crate::{
     bam_boost::{BamBoostCommands, ClaimStatusActions, MerkleDistributorActions, NetworkArg},
     cli_config::CliConfig,
-    JITOSOL_MINT,
+    pda, JITOSOL_MINT,
 };
 
 #[allow(dead_code)]
@@ -70,30 +70,6 @@ impl BamBoostCliHandler {
         }
     }
 
-    fn merkle_distributor_address(&self, jitosol_mint: Pubkey, epoch: u64) -> Pubkey {
-        Pubkey::find_program_address(
-            &[
-                b"merkle_distributor",
-                jitosol_mint.to_bytes().as_slice(),
-                epoch.to_le_bytes().as_slice(),
-            ],
-            &self.bam_boost_program_id,
-        )
-        .0
-    }
-
-    fn claim_status_address(&self, claimant: Pubkey, distributor_pda: Pubkey) -> Pubkey {
-        Pubkey::find_program_address(
-            &[
-                b"claim_status",
-                claimant.to_bytes().as_slice(),
-                distributor_pda.to_bytes().as_slice(),
-            ],
-            &self.bam_boost_program_id,
-        )
-        .0
-    }
-
     async fn claim(&self, cluster: &str, epoch: u64) -> anyhow::Result<()> {
         let rpc_client = self.get_rpc_client();
         let signer = self
@@ -102,14 +78,14 @@ impl BamBoostCliHandler {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("signer is required"))?;
 
-        let distributor_pda = self.merkle_distributor_address(JITOSOL_MINT, epoch);
+        let distributor_pda = pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
         let distributor_token_address = get_associated_token_address_with_program_id(
             &Pubkey::new_from_array(distributor_pda.to_bytes()),
             &JITOSOL_MINT,
             &spl_token_interface::id(),
         );
 
-        let claim_status_pda = self.claim_status_address(signer.pubkey(), distributor_pda);
+        let claim_status_pda = pda::claim_status_address(&self.bam_boost_program_id, &signer.pubkey(), &distributor_pda);
         let claimant_token_address = get_associated_token_address_with_program_id(
             &signer.pubkey(),
             &JITOSOL_MINT,
@@ -196,9 +172,9 @@ impl BamBoostCliHandler {
     }
 
     fn get_claim_status(&self, epoch: u64, claimant: Pubkey) -> anyhow::Result<()> {
-        let distributor_pda = self.merkle_distributor_address(JITOSOL_MINT, epoch);
+        let distributor_pda = pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
 
-        let claim_status_pda = self.claim_status_address(claimant, distributor_pda);
+        let claim_status_pda = pda::claim_status_address(&self.bam_boost_program_id, &claimant, &distributor_pda);
 
         println!("ClaimStatus PDA: {claim_status_pda}");
 
