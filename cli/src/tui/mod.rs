@@ -11,7 +11,7 @@ use solana_rpc_client::rpc_client::RpcClient;
 use tokio::sync::mpsc;
 
 use crate::bam_boost_handler::default_cache_dir;
-use crate::batch_claim::{claim_epochs, ClaimEvent, ClaimState};
+use crate::batch_claim::claim_epochs;
 use crate::cli_config::CliConfig;
 use crate::scanner::Scanner;
 use app::{Action, App, AppEvent};
@@ -85,7 +85,15 @@ async fn event_loop(
                 let tx = tx.clone();
                 let network = app.network.clone();
                 let rpc_url = app.rpc_url.clone();
-                let claimant: Pubkey = app.claimant_input.parse()?;
+                let claimant: Pubkey = match app.claimant_input.parse() {
+                    Ok(claimant) => claimant,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::ScanFinished(Err(format!(
+                            "invalid claimant pubkey: {e}"
+                        ))));
+                        continue;
+                    }
+                };
                 tokio::spawn(async move {
                     let scanner = Scanner::new(default_cache_dir());
                     let rpc = RpcClient::new_with_commitment(rpc_url, commitment);
@@ -114,13 +122,14 @@ async fn event_loop(
                         &tx,
                     )
                     .await;
-                    if let Err(e) = outcome {
-                        let _ = tx.send(AppEvent::Claim(ClaimEvent {
-                            epoch: 0,
-                            state: ClaimState::Failed(e.to_string()),
-                        }));
+                    match outcome {
+                        Ok(()) => {
+                            let _ = tx.send(AppEvent::ClaimRunFinished);
+                        }
+                        Err(e) => {
+                            let _ = tx.send(AppEvent::ClaimRunFailed(e.to_string()));
+                        }
                     }
-                    let _ = tx.send(AppEvent::ClaimRunFinished);
                 });
             }
             None => {}

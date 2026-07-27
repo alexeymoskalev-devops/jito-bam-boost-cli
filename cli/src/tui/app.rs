@@ -54,6 +54,7 @@ pub enum AppEvent {
     ScanFinished(Result<Vec<EpochStatus>, String>),
     Claim(ClaimEvent),
     ClaimRunFinished,
+    ClaimRunFailed(String),
 }
 
 /// Side effects the reducer asks the caller (event loop) to perform.
@@ -82,6 +83,7 @@ pub struct App {
     pub scanning: bool,
     pub progress_rows: Vec<ClaimEvent>,
     pub claim_done: bool,
+    pub progress_error: Option<String>,
 }
 
 impl Default for App {
@@ -106,6 +108,7 @@ impl App {
             scanning: false,
             progress_rows: Vec::new(),
             claim_done: false,
+            progress_error: None,
         }
     }
 
@@ -124,6 +127,11 @@ impl App {
             }
             AppEvent::ClaimRunFinished => {
                 self.claim_done = true;
+                None
+            }
+            AppEvent::ClaimRunFailed(msg) => {
+                self.claim_done = true;
+                self.progress_error = Some(msg);
                 None
             }
         }
@@ -310,6 +318,7 @@ impl App {
     fn confirm_claim(&mut self) -> Option<Action> {
         self.screen = Screen::Progress;
         self.progress_rows.clear();
+        self.progress_error = None;
         self.claim_done = false;
         let mut epochs: Vec<u64> = self.selected.iter().copied().collect();
         epochs.sort_unstable();
@@ -442,6 +451,44 @@ mod tests {
     #[test]
     fn q_quits_from_dashboard() {
         let mut app = scanned_app();
+        assert!(matches!(
+            app.handle(key(KeyCode::Char('q'))),
+            Some(Action::Quit)
+        ));
+    }
+
+    #[test]
+    fn scan_finished_err_routes_back_to_setup_with_error() {
+        let mut app = App::new();
+        app.claimant_input = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn".into();
+        app.setup_focus = SetupField::Start;
+        assert!(matches!(
+            app.handle(key(KeyCode::Enter)),
+            Some(Action::StartScan)
+        ));
+        assert!(app
+            .handle(AppEvent::ScanFinished(Err("boom".into())))
+            .is_none());
+        assert!(!app.scanning);
+        assert!(matches!(app.screen, Screen::Setup));
+        assert_eq!(app.setup_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn claim_run_failed_marks_done_sets_error_and_q_quits() {
+        let mut app = scanned_app();
+        app.handle(key(KeyCode::Char('a')));
+        app.handle(key(KeyCode::Char('c')));
+        app.keypair_input = "/tmp/id.json".into();
+        app.handle(key(KeyCode::Char('y')));
+        assert!(matches!(app.screen, Screen::Progress));
+
+        assert!(app
+            .handle(AppEvent::ClaimRunFailed("keypair read failed".into()))
+            .is_none());
+        assert!(app.claim_done);
+        assert_eq!(app.progress_error.as_deref(), Some("keypair read failed"));
+
         assert!(matches!(
             app.handle(key(KeyCode::Char('q'))),
             Some(Action::Quit)

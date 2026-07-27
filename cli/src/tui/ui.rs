@@ -270,9 +270,15 @@ fn claim_state_str(state: &ClaimState) -> String {
 
 fn draw_progress(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    let has_error = app.progress_error.is_some();
+    let mut constraints = vec![Constraint::Min(1)];
+    if has_error {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Length(1)); // footer
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints(constraints)
         .split(area);
 
     let rows: Vec<Row> = app
@@ -286,9 +292,17 @@ fn draw_progress(frame: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Progress"));
     frame.render_widget(table, chunks[0]);
 
+    let mut idx = 1;
+    if let Some(err) = &app.progress_error {
+        let error_para = Paragraph::new(format!("Claim run failed: {err}"))
+            .style(Style::default().fg(ratatui::style::Color::Red));
+        frame.render_widget(error_para, chunks[idx]);
+        idx += 1;
+    }
+
     if app.claim_done {
         let footer = Paragraph::new("b back to dashboard · q quit");
-        frame.render_widget(footer, chunks[1]);
+        frame.render_widget(footer, chunks[idx]);
     }
 }
 
