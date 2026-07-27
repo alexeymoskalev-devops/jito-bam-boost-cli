@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Clear, Paragraph, Row, Table},
+    widgets::{Block, Borders, Clear, Paragraph, Row, Table, TableState},
     Frame,
 };
 
@@ -154,23 +154,17 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         let rows: Vec<Row> = app
             .statuses
             .iter()
-            .enumerate()
-            .map(|(i, status)| {
+            .map(|status| {
                 let amount_str = status
                     .amount
                     .map(format_jitosol)
                     .unwrap_or_else(|| "-".to_string());
-                let row = Row::new(vec![
+                Row::new(vec![
                     sel_str(app, status).to_string(),
                     status.epoch.to_string(),
                     amount_str,
                     status_str(status).to_string(),
-                ]);
-                if i == app.cursor {
-                    row.style(Style::default().add_modifier(Modifier::REVERSED))
-                } else {
-                    row
-                }
+                ])
             })
             .collect();
 
@@ -183,8 +177,11 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                 Constraint::Length(15),
             ],
         )
-        .header(Row::new(vec!["Sel", "Epoch", "Amount (JitoSOL)", "Status"]));
-        frame.render_widget(table, chunks[1]);
+        .header(Row::new(vec!["Sel", "Epoch", "Amount (JitoSOL)", "Status"]))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+        let mut table_state = TableState::default().with_selected(Some(app.cursor));
+        frame.render_stateful_widget(table, chunks[1], &mut table_state);
     }
 
     let (unclaimed_count, unclaimed_total) = app
@@ -303,8 +300,12 @@ fn draw_progress(frame: &mut Frame, app: &App) {
 
     let table = Table::new(rows, [Constraint::Length(10), Constraint::Min(1)])
         .header(Row::new(vec!["Epoch", "State"]))
-        .block(Block::default().borders(Borders::ALL).title("Progress"));
-    frame.render_widget(table, chunks[0]);
+        .block(Block::default().borders(Borders::ALL).title("Progress"))
+        .row_highlight_style(Style::default());
+
+    let mut table_state =
+        TableState::default().with_selected(Some(app.progress_rows.len().saturating_sub(1)));
+    frame.render_stateful_widget(table, chunks[0], &mut table_state);
 
     let mut idx = 1;
     if let Some(err) = &app.progress_error {
@@ -400,5 +401,31 @@ mod tests {
         let text = buffer_text(&terminal);
 
         assert!(text.contains("keypair path is required"));
+    }
+
+    #[test]
+    fn dashboard_table_scrolls_to_keep_cursor_visible() {
+        let mut app = App::new();
+        app.screen = crate::tui::app::Screen::Dashboard;
+        app.claimant_input = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn".into();
+        app.statuses = (0..30)
+            .map(|i| EpochStatus {
+                epoch: 200 + i,
+                amount: Some(1_000_000_000),
+                claimed: false,
+            })
+            .collect();
+        app.cursor = 25;
+
+        // Small terminal: header (3 rows) + footer (1 row) leave little room
+        // for the table, so all 30 rows cannot fit without scrolling.
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        // The epoch under the cursor must be visible...
+        assert!(text.contains("225"));
+        // ...and the first epoch must have scrolled out of view.
+        assert!(!text.contains("200"));
     }
 }
