@@ -109,19 +109,17 @@ async fn event_loop(
                 keypair_path,
             }) => {
                 let tx = tx.clone();
-                let network = app.network.clone();
-                let rpc_url = app.rpc_url.clone();
+                let request = ClaimRunRequest {
+                    network: app.network.clone(),
+                    rpc_url: app.rpc_url.clone(),
+                    commitment,
+                    program_id,
+                    keypair_path,
+                    claimant: app.claimant_input.clone(),
+                    epochs,
+                };
                 tokio::spawn(async move {
-                    let outcome = run_claims(
-                        &network,
-                        rpc_url,
-                        commitment,
-                        &keypair_path,
-                        program_id,
-                        &epochs,
-                        &tx,
-                    )
-                    .await;
+                    let outcome = run_claims(&request, &tx).await;
                     match outcome {
                         Ok(()) => {
                             let _ = tx.send(AppEvent::ClaimRunFinished);
@@ -137,20 +135,36 @@ async fn event_loop(
     }
 }
 
-async fn run_claims(
-    network: &str,
+/// Everything `run_claims` needs to sign and submit a batch of claims.
+///
+/// Bundled into one struct so the async task closure doesn't have to carry
+/// (and `run_claims` doesn't have to accept) a long, error-prone parameter list.
+struct ClaimRunRequest {
+    network: String,
     rpc_url: String,
     commitment: CommitmentConfig,
-    keypair_path: &str,
     program_id: Pubkey,
-    epochs: &[u64],
+    keypair_path: String,
+    claimant: String,
+    epochs: Vec<u64>,
+}
+
+async fn run_claims(
+    request: &ClaimRunRequest,
     tx: &mpsc::UnboundedSender<AppEvent>,
 ) -> anyhow::Result<()> {
-    let keypair = read_keypair_file(keypair_path)
+    let keypair = read_keypair_file(&request.keypair_path)
         .map_err(|e| anyhow::anyhow!("Failed to read keypair: {e}"))?;
+    let actual = solana_keypair::Signer::pubkey(&keypair).to_string();
+    if actual != request.claimant {
+        anyhow::bail!(
+            "keypair pubkey {actual} does not match claimant {}",
+            request.claimant
+        );
+    }
     let cli_config = CliConfig {
-        rpc_url,
-        commitment,
+        rpc_url: request.rpc_url.clone(),
+        commitment: request.commitment,
         signer: Some(Arc::new(keypair)),
     };
     let scanner = Scanner::new(default_cache_dir());
@@ -158,13 +172,43 @@ async fn run_claims(
     claim_epochs(
         &scanner,
         &cli_config,
-        &program_id,
-        network,
-        epochs,
+        &request.program_id,
+        &request.network,
+        &request.epochs,
         &mut move |event| {
             let _ = progress_tx.send(AppEvent::Claim(event));
         },
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn run_claims_rejects_keypair_claimant_mismatch() {
+        let keypair = solana_keypair::Keypair::new();
+        let keypair_file = tempfile::NamedTempFile::new().unwrap();
+        solana_keypair::write_keypair_file(&keypair, keypair_file.path()).unwrap();
+
+        let (tx, _rx) = mpsc::unbounded_channel::<AppEvent>();
+        let mismatched_claimant = Pubkey::new_unique().to_string();
+
+        let request = ClaimRunRequest {
+            network: "mainnet".to_string(),
+            rpc_url: "http://localhost:1".to_string(),
+            commitment: CommitmentConfig::confirmed(),
+            program_id: Pubkey::new_unique(),
+            keypair_path: keypair_file.path().to_str().unwrap().to_string(),
+            claimant: mismatched_claimant,
+            epochs: vec![],
+        };
+
+        let result = run_claims(&request, &tx).await;
+
+        let err = result.expect_err("mismatched claimant must fail before claiming");
+        assert!(err.to_string().contains("does not match claimant"));
+    }
 }

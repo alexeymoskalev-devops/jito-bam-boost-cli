@@ -259,7 +259,7 @@ impl App {
                 }
                 None
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if !self.scanning => {
                 self.scanning = true;
                 Some(Action::StartScan)
             }
@@ -472,6 +472,23 @@ mod tests {
         assert!(!app.scanning);
         assert!(matches!(app.screen, Screen::Setup));
         assert_eq!(app.setup_error.as_deref(), Some("boom"));
+    }
+
+    #[test]
+    fn r_is_noop_while_scanning_but_starts_scan_when_idle() {
+        let mut app = scanned_app();
+        assert!(!app.scanning);
+
+        app.scanning = true;
+        assert!(app.handle(key(KeyCode::Char('r'))).is_none());
+        assert!(app.scanning);
+
+        app.scanning = false;
+        assert!(matches!(
+            app.handle(key(KeyCode::Char('r'))),
+            Some(Action::StartScan)
+        ));
+        assert!(app.scanning);
     }
 
     #[test]

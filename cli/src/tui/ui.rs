@@ -1,6 +1,7 @@
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
+    text::Line,
     widgets::{Block, Borders, Clear, Paragraph, Row, Table},
     Frame,
 };
@@ -228,9 +229,13 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App) {
     let mut epochs: Vec<u64> = app.selected.iter().copied().collect();
     epochs.sort_unstable();
 
-    let mut lines: Vec<String> = epochs.iter().take(10).map(|e| e.to_string()).collect();
+    let mut lines: Vec<Line> = epochs
+        .iter()
+        .take(10)
+        .map(|e| Line::from(e.to_string()))
+        .collect();
     if epochs.len() > 10 {
-        lines.push(format!("… and {} more", epochs.len() - 10));
+        lines.push(Line::from(format!("… and {} more", epochs.len() - 10)));
     }
 
     let total: u64 = epochs
@@ -242,14 +247,23 @@ fn draw_confirm_popup(frame: &mut Frame, app: &App) {
                 .and_then(|s| s.amount)
         })
         .sum();
-    lines.push(String::new());
-    lines.push(format!("Total: {} JitoSOL", format_jitosol(total)));
-    lines.push(format!("Keypair path: {}", app.keypair_input));
-    lines.push(String::new());
-    lines.push("y confirm · n cancel".to_string());
+    lines.push(Line::from(""));
+    lines.push(Line::from(format!(
+        "Total: {} JitoSOL",
+        format_jitosol(total)
+    )));
+    lines.push(Line::from(format!("Keypair path: {}", app.keypair_input)));
+    if let Some(err) = &app.setup_error {
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("Error: {err}"),
+            Style::default().fg(ratatui::style::Color::Red),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from("y confirm · n cancel"));
 
-    let text = lines.join("\n");
-    let popup = Paragraph::new(text)
+    let popup = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -366,5 +380,25 @@ mod tests {
         assert!(text.contains("Network"));
         assert!(text.contains("RPC URL"));
         assert!(text.contains("Claimant"));
+    }
+
+    #[test]
+    fn confirm_popup_shows_setup_error_when_keypair_missing() {
+        let mut app = App::new();
+        app.screen = crate::tui::app::Screen::Confirm;
+        app.claimant_input = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn".into();
+        app.statuses = vec![EpochStatus {
+            epoch: 1,
+            amount: Some(10),
+            claimed: false,
+        }];
+        app.selected = std::collections::HashSet::from([1]);
+        app.setup_error = Some("keypair path is required".to_string());
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let text = buffer_text(&terminal);
+
+        assert!(text.contains("keypair path is required"));
     }
 }
