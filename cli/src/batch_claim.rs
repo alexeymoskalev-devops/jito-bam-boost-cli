@@ -79,7 +79,7 @@ pub async fn claim_epochs(
     program_id: &Pubkey,
     network: &str,
     epochs: &[u64],
-    progress: &mut dyn FnMut(ClaimEvent),
+    progress: &mut (dyn FnMut(ClaimEvent) + Send),
 ) -> anyhow::Result<Vec<ClaimEvent>> {
     let signer = cli_config
         .signer
