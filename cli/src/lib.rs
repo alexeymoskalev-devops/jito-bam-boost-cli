@@ -2,6 +2,7 @@ use solana_pubkey::{pubkey, Pubkey};
 
 pub mod bam_boost;
 pub mod bam_boost_handler;
+pub mod batch_claim;
 pub mod cli_args;
 pub mod cli_config;
 pub mod pda;

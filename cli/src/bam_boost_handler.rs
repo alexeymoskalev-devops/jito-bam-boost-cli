@@ -1,15 +1,11 @@
 use anyhow::anyhow;
 use borsh::BorshDeserialize;
-use jito_bam_boost_client::{accounts::ClaimStatus, instructions::ClaimBuilder};
+use jito_bam_boost_client::accounts::ClaimStatus;
 use jito_bam_boost_merkle_tree::bam_boost_merkle_tree::BamBoostMerkleTree;
 use solana_keypair::Signer;
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
 use solana_transaction::{Instruction, Signers, Transaction};
-use spl_associated_token_account_interface::{
-    address::get_associated_token_address_with_program_id,
-    instruction::create_associated_token_account_idempotent,
-};
 
 use crate::{
     bam_boost::{BamBoostCommands, ClaimStatusActions, MerkleDistributorActions, NetworkArg},
@@ -100,21 +96,10 @@ impl BamBoostCliHandler {
 
         let distributor_pda =
             pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
-        let distributor_token_address = get_associated_token_address_with_program_id(
-            &Pubkey::new_from_array(distributor_pda.to_bytes()),
-            &JITOSOL_MINT,
-            &spl_token_interface::id(),
-        );
-
         let claim_status_pda = pda::claim_status_address(
             &self.bam_boost_program_id,
             &signer.pubkey(),
             &distributor_pda,
-        );
-        let claimant_token_address = get_associated_token_address_with_program_id(
-            &signer.pubkey(),
-            &JITOSOL_MINT,
-            &spl_token_interface::id(),
         );
 
         let url = format!(
@@ -150,46 +135,29 @@ impl BamBoostCliHandler {
                 }
             };
 
-        let node = merkle_tree.get_node(&signer.pubkey());
-
-        let claim_status_pda = Pubkey::new_from_array(claim_status_pda.to_bytes());
-
         if rpc_client.get_account(&claim_status_pda).is_ok() {
             return Err(anyhow!("Claim status account already exists — subsidy for this epoch has already been claimed."));
         }
 
-        let mut ix_builder = ClaimBuilder::new();
-        ix_builder
-            .distributor(Pubkey::new_from_array(distributor_pda.to_bytes()))
-            .claim_status(claim_status_pda)
-            .from(distributor_token_address)
-            .to(claimant_token_address)
-            .claimant(signer.pubkey())
-            .token_program(spl_token_interface::id())
-            .amount(node.amount)
-            .proof(node.proof.unwrap());
-        let mut ix = ix_builder.instruction();
-        ix.program_id = self.bam_boost_program_id;
-
-        log::info!("Claiming parameters: {ix_builder:?}");
-
-        self.process_transaction(
-            &[
-                create_associated_token_account_idempotent(
-                    &signer.pubkey(),
-                    &signer.pubkey(),
-                    &JITOSOL_MINT,
-                    &spl_token_interface::id(),
-                ),
-                ix,
-            ],
+        let node = merkle_tree.get_node(&signer.pubkey());
+        let proof = node
+            .proof
+            .clone()
+            .ok_or_else(|| anyhow!("merkle proof missing for claimant"))?;
+        let ixs = crate::batch_claim::build_claim_ixs(
+            &self.bam_boost_program_id,
             &signer.pubkey(),
-            &[signer],
-        )?;
+            epoch,
+            node.amount,
+            proof,
+        );
+
+        log::info!("Claiming epoch {epoch} for {}", signer.pubkey());
+
+        self.process_transaction(&ixs, &signer.pubkey(), &[signer])?;
 
         if !self.print_tx {
-            let claim_status_acc = self
-                .get_account::<ClaimStatus>(&Pubkey::new_from_array(claim_status_pda.to_bytes()))?;
+            let claim_status_acc = self.get_account::<ClaimStatus>(&claim_status_pda)?;
             log::info!("ClaimStatus: {claim_status_acc:?}");
         }
 
