@@ -78,14 +78,19 @@ impl BamBoostCliHandler {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("signer is required"))?;
 
-        let distributor_pda = pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
+        let distributor_pda =
+            pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
         let distributor_token_address = get_associated_token_address_with_program_id(
             &Pubkey::new_from_array(distributor_pda.to_bytes()),
             &JITOSOL_MINT,
             &spl_token_interface::id(),
         );
 
-        let claim_status_pda = pda::claim_status_address(&self.bam_boost_program_id, &signer.pubkey(), &distributor_pda);
+        let claim_status_pda = pda::claim_status_address(
+            &self.bam_boost_program_id,
+            &signer.pubkey(),
+            &distributor_pda,
+        );
         let claimant_token_address = get_associated_token_address_with_program_id(
             &signer.pubkey(),
             &JITOSOL_MINT,
@@ -172,9 +177,11 @@ impl BamBoostCliHandler {
     }
 
     fn get_claim_status(&self, epoch: u64, claimant: Pubkey) -> anyhow::Result<()> {
-        let distributor_pda = pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
+        let distributor_pda =
+            pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
 
-        let claim_status_pda = pda::claim_status_address(&self.bam_boost_program_id, &claimant, &distributor_pda);
+        let claim_status_pda =
+            pda::claim_status_address(&self.bam_boost_program_id, &claimant, &distributor_pda);
 
         println!("ClaimStatus PDA: {claim_status_pda}");
 

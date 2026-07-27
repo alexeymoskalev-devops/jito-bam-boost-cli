@@ -14,7 +14,11 @@ pub fn merkle_distributor_address(program_id: &Pubkey, mint: &Pubkey, epoch: u64
 }
 
 /// PDA of a claimant's ClaimStatus for a given distributor.
-pub fn claim_status_address(program_id: &Pubkey, claimant: &Pubkey, distributor: &Pubkey) -> Pubkey {
+pub fn claim_status_address(
+    program_id: &Pubkey,
+    claimant: &Pubkey,
+    distributor: &Pubkey,
+) -> Pubkey {
     Pubkey::find_program_address(
         &[
             b"claim_status",
