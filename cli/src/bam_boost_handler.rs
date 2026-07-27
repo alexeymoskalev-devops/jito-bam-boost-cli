@@ -238,10 +238,7 @@ impl BamBoostCliHandler {
             .scan(network, &claimant, &rpc_client, &self.bam_boost_program_id)
             .await?;
 
-        let unclaimed: Vec<_> = statuses
-            .iter()
-            .filter(|s| s.amount.is_some() && !s.claimed)
-            .collect();
+        let unclaimed: Vec<_> = statuses.iter().filter(|s| s.is_claimable()).collect();
         if unclaimed.is_empty() {
             println!("Nothing to claim: no unclaimed epochs for {claimant}");
             return Ok(());

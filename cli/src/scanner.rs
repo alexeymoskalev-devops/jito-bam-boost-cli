@@ -214,6 +214,13 @@ pub struct EpochStatus {
     pub claimed: bool,
 }
 
+impl EpochStatus {
+    /// Whether this epoch has an unclaimed allocation for the claimant.
+    pub fn is_claimable(&self) -> bool {
+        self.amount.is_some() && !self.claimed
+    }
+}
+
 #[derive(Deserialize)]
 struct ListResponse {
     #[serde(default)]

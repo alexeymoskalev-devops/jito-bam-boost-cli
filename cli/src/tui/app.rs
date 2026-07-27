@@ -264,7 +264,7 @@ impl App {
         let Some(status) = self.statuses.get(self.cursor) else {
             return;
         };
-        if status.amount.is_none() || status.claimed {
+        if !status.is_claimable() {
             return;
         }
         let epoch = status.epoch;
@@ -276,7 +276,7 @@ impl App {
     fn claimable_epochs(&self) -> HashSet<u64> {
         self.statuses
             .iter()
-            .filter(|s| s.amount.is_some() && !s.claimed)
+            .filter(|s| s.is_claimable())
             .map(|s| s.epoch)
             .collect()
     }

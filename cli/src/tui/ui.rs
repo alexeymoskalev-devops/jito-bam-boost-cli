@@ -7,6 +7,7 @@ use ratatui::{
 
 use crate::bam_boost_handler::format_jitosol;
 use crate::batch_claim::ClaimState;
+use crate::scanner::EpochStatus;
 use crate::tui::app::{App, Screen, SetupField};
 
 /// Renders the current screen of the TUI. Pure rendering: no state mutation.
@@ -108,20 +109,20 @@ fn draw_setup(frame: &mut Frame, app: &App) {
     frame.render_widget(footer, chunks[idx]);
 }
 
-fn status_str(amount: Option<u64>, claimed: bool) -> &'static str {
-    if amount.is_none() {
+fn status_str(status: &EpochStatus) -> &'static str {
+    if status.amount.is_none() {
         "not eligible"
-    } else if claimed {
+    } else if status.claimed {
         "claimed"
     } else {
         "unclaimed"
     }
 }
 
-fn sel_str(app: &App, epoch: u64, amount: Option<u64>, claimed: bool) -> &'static str {
-    if amount.is_none() || claimed {
+fn sel_str(app: &App, status: &EpochStatus) -> &'static str {
+    if !status.is_claimable() {
         "   "
-    } else if app.selected.contains(&epoch) {
+    } else if app.selected.contains(&status.epoch) {
         "[x]"
     } else {
         "[ ]"
@@ -159,10 +160,10 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
                     .map(format_jitosol)
                     .unwrap_or_else(|| "-".to_string());
                 let row = Row::new(vec![
-                    sel_str(app, status.epoch, status.amount, status.claimed).to_string(),
+                    sel_str(app, status).to_string(),
                     status.epoch.to_string(),
                     amount_str,
-                    status_str(status.amount, status.claimed).to_string(),
+                    status_str(status).to_string(),
                 ]);
                 if i == app.cursor {
                     row.style(Style::default().add_modifier(Modifier::REVERSED))
@@ -185,17 +186,13 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         frame.render_widget(table, chunks[1]);
     }
 
-    let unclaimed_count = app
+    let (unclaimed_count, unclaimed_total) = app
         .statuses
         .iter()
-        .filter(|s| s.amount.is_some() && !s.claimed)
-        .count();
-    let unclaimed_total: u64 = app
-        .statuses
-        .iter()
-        .filter(|s| !s.claimed)
-        .filter_map(|s| s.amount)
-        .sum();
+        .filter(|s| s.is_claimable())
+        .fold((0usize, 0u64), |(count, total), s| {
+            (count + 1, total + s.amount.unwrap_or(0))
+        });
     let footer = Paragraph::new(format!(
         "Unclaimed: {} epochs, {} JitoSOL    space select · a all · c claim · r rescan · q quit",
         unclaimed_count,
