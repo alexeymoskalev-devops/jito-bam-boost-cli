@@ -9,6 +9,9 @@ use crate::scanner::EpochStatus;
 pub const DEFAULT_MAINNET_RPC: &str = "https://api.mainnet-beta.solana.com";
 pub const DEFAULT_TESTNET_RPC: &str = "https://api.testnet.solana.com";
 
+/// Number of rows rendered per page of the paginated history list.
+pub const PAGE_SIZE: usize = 20;
+
 /// Which screen of the TUI is currently active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -78,7 +81,11 @@ pub struct App {
     pub setup_focus: SetupField,
     pub setup_error: Option<String>,
     pub statuses: Vec<EpochStatus>,
+    /// Index into `claimable_sorted()` (the claimable subset, descending by epoch),
+    /// NOT an index into `statuses`.
     pub cursor: usize,
+    /// Current page (0-based) of the paginated full history list.
+    pub page: usize,
     pub selected: HashSet<u64>,
     pub scanning: bool,
     pub progress_rows: Vec<ClaimEvent>,
@@ -104,6 +111,7 @@ impl App {
             setup_error: None,
             statuses: Vec::new(),
             cursor: 0,
+            page: 0,
             selected: HashSet::new(),
             scanning: false,
             progress_rows: Vec::new(),
@@ -225,6 +233,7 @@ impl App {
             Ok(statuses) => {
                 self.statuses = statuses;
                 self.cursor = 0;
+                self.page = 0;
                 self.selected.clear();
             }
             Err(msg) => {
@@ -241,8 +250,16 @@ impl App {
                 None
             }
             KeyCode::Down => {
-                let max = self.statuses.len().saturating_sub(1);
+                let max = self.claimable_sorted().len().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(max);
+                None
+            }
+            KeyCode::Left | KeyCode::PageUp => {
+                self.page = self.page.saturating_sub(1);
+                None
+            }
+            KeyCode::Right | KeyCode::PageDown => {
+                self.page = (self.page + 1).min(self.max_page());
                 None
             }
             KeyCode::Char(' ') => {
@@ -268,25 +285,36 @@ impl App {
         }
     }
 
+    /// Epochs that are claimable, sorted descending (newest first). `cursor`
+    /// indexes into this subset, not into `statuses`.
+    pub fn claimable_sorted(&self) -> Vec<u64> {
+        let mut epochs: Vec<u64> = self
+            .statuses
+            .iter()
+            .filter(|s| s.is_claimable())
+            .map(|s| s.epoch)
+            .collect();
+        epochs.sort_unstable_by(|a, b| b.cmp(a));
+        epochs
+    }
+
+    /// Last valid page index for the paginated full history list.
+    fn max_page(&self) -> usize {
+        self.statuses.len().saturating_sub(1) / PAGE_SIZE
+    }
+
     fn toggle_cursor_selection(&mut self) {
-        let Some(status) = self.statuses.get(self.cursor) else {
+        let claimable = self.claimable_sorted();
+        let Some(&epoch) = claimable.get(self.cursor) else {
             return;
         };
-        if !status.is_claimable() {
-            return;
-        }
-        let epoch = status.epoch;
         if !self.selected.remove(&epoch) {
             self.selected.insert(epoch);
         }
     }
 
     fn claimable_epochs(&self) -> HashSet<u64> {
-        self.statuses
-            .iter()
-            .filter(|s| s.is_claimable())
-            .map(|s| s.epoch)
-            .collect()
+        self.claimable_sorted().into_iter().collect()
     }
 
     fn handle_confirm_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -513,5 +541,155 @@ mod tests {
             app.handle(key(KeyCode::Char('q'))),
             Some(Action::Quit)
         ));
+    }
+
+    /// Mixed fixture: epoch 1 claimed (not claimable), epoch 2 unclaimed
+    /// (claimable), epoch 3 expired (not claimable), epoch 4 unclaimed
+    /// (claimable), epoch 5 has no allocation (not claimable).
+    /// `claimable_sorted()` for this fixture is `[4, 2]` (descending).
+    fn mixed_scanned_app() -> App {
+        let mut app = App::new();
+        app.claimant_input = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn".into();
+        app.setup_focus = SetupField::Start;
+        assert!(matches!(
+            app.handle(key(KeyCode::Enter)),
+            Some(Action::StartScan)
+        ));
+        app.handle(AppEvent::ScanFinished(Ok(vec![
+            EpochStatus {
+                epoch: 1,
+                amount: Some(10),
+                claimed: true,
+                expired: false,
+            },
+            EpochStatus {
+                epoch: 2,
+                amount: Some(20),
+                claimed: false,
+                expired: false,
+            },
+            EpochStatus {
+                epoch: 3,
+                amount: Some(30),
+                claimed: false,
+                expired: true,
+            },
+            EpochStatus {
+                epoch: 4,
+                amount: Some(40),
+                claimed: false,
+                expired: false,
+            },
+            EpochStatus {
+                epoch: 5,
+                amount: None,
+                claimed: false,
+                expired: false,
+            },
+        ])));
+        app
+    }
+
+    #[test]
+    fn cursor_moves_over_claimable_subset_only_desc_order_clamped() {
+        let mut app = mixed_scanned_app();
+        assert_eq!(app.claimable_sorted(), vec![4, 2]);
+        assert_eq!(app.cursor, 0);
+
+        // Down moves to the next claimable epoch (2), not to epoch 3 (expired)
+        // or epoch 1 (claimed), which are skipped entirely.
+        app.handle(key(KeyCode::Down));
+        assert_eq!(app.cursor, 1);
+
+        // Clamped at the end of the claimable subset (len 2 -> max index 1).
+        app.handle(key(KeyCode::Down));
+        assert_eq!(app.cursor, 1);
+
+        app.handle(key(KeyCode::Up));
+        assert_eq!(app.cursor, 0);
+
+        // Clamped at the start.
+        app.handle(key(KeyCode::Up));
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[test]
+    fn space_toggles_epoch_under_cursor_in_claimable_subset() {
+        let mut app = mixed_scanned_app();
+        // cursor 0 -> claimable_sorted()[0] == 4
+        app.handle(key(KeyCode::Char(' ')));
+        assert_eq!(app.selected, HashSet::from([4]));
+
+        // toggling again deselects it
+        app.handle(key(KeyCode::Char(' ')));
+        assert!(app.selected.is_empty());
+
+        // move cursor to the second claimable epoch (2) and toggle it
+        app.handle(key(KeyCode::Down));
+        app.handle(key(KeyCode::Char(' ')));
+        assert_eq!(app.selected, HashSet::from([2]));
+    }
+
+    #[test]
+    fn select_all_excludes_expired() {
+        let mut app = mixed_scanned_app();
+        app.handle(key(KeyCode::Char('a')));
+        assert_eq!(app.selected, HashSet::from([2, 4]));
+    }
+
+    #[test]
+    fn paging_clamps_at_both_ends() {
+        let mut app = App::new();
+        app.claimant_input = "J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn".into();
+        app.setup_focus = SetupField::Start;
+        app.handle(key(KeyCode::Enter));
+        let statuses: Vec<EpochStatus> = (0..45)
+            .map(|i| EpochStatus {
+                epoch: i,
+                amount: Some(1),
+                claimed: false,
+                expired: false,
+            })
+            .collect();
+        app.handle(AppEvent::ScanFinished(Ok(statuses)));
+
+        // 45 statuses, PAGE_SIZE 20 -> max_page = (45 - 1) / 20 = 2.
+        assert_eq!(app.page, 0);
+
+        // Left/PageUp clamp at 0.
+        app.handle(key(KeyCode::Left));
+        assert_eq!(app.page, 0);
+        app.handle(key(KeyCode::PageUp));
+        assert_eq!(app.page, 0);
+
+        // Right/PageDown advance, clamping at max_page (2).
+        app.handle(key(KeyCode::Right));
+        assert_eq!(app.page, 1);
+        app.handle(key(KeyCode::PageDown));
+        assert_eq!(app.page, 2);
+        app.handle(key(KeyCode::Right));
+        assert_eq!(app.page, 2);
+        app.handle(key(KeyCode::PageDown));
+        assert_eq!(app.page, 2);
+    }
+
+    #[test]
+    fn scan_finished_resets_page() {
+        let mut app = mixed_scanned_app();
+        app.handle(key(KeyCode::Right));
+        assert_eq!(app.page, 0, "5 statuses fit on one page already");
+
+        // Force page to a non-zero value directly to prove ScanFinished resets it
+        // regardless of prior state.
+        app.page = 3;
+        app.handle(AppEvent::ScanFinished(Ok(vec![EpochStatus {
+            epoch: 1,
+            amount: Some(10),
+            claimed: false,
+            expired: false,
+        }])));
+        assert_eq!(app.page, 0);
+        assert_eq!(app.cursor, 0);
+        assert!(app.selected.is_empty());
     }
 }
