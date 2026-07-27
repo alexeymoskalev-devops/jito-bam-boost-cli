@@ -17,6 +17,17 @@ use crate::{
     pda, JITOSOL_MINT,
 };
 
+pub fn format_jitosol(lamports: u64) -> String {
+    let base = 10u64.pow(jito_bam_boost_merkle_tree::tree_node::MINT_DECIMALS);
+    format!("{}.{:09}", lamports / base, lamports % base)
+}
+
+pub fn default_cache_dir() -> std::path::PathBuf {
+    dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("jito-bam-boost")
+}
+
 #[allow(dead_code)]
 pub struct BamBoostCliHandler {
     /// The configuration of CLI
@@ -63,6 +74,15 @@ impl BamBoostCliHandler {
                 };
 
                 self.claim(network, epoch).await
+            }
+            BamBoostCommands::MerkleDistributor {
+                action: MerkleDistributorActions::Status { network, claimant },
+            } => {
+                let network = match network {
+                    NetworkArg::Mainnet => "mainnet",
+                    NetworkArg::Testnet => "testnet",
+                };
+                self.status(network, claimant).await
             }
             BamBoostCommands::ClaimStatus {
                 action: ClaimStatusActions::Get { epoch, claimant },
@@ -176,6 +196,40 @@ impl BamBoostCliHandler {
         Ok(())
     }
 
+    async fn status(&self, network: &str, claimant: Pubkey) -> anyhow::Result<()> {
+        let scanner = crate::scanner::Scanner::new(default_cache_dir());
+        let rpc_client = self.get_rpc_client();
+        let statuses = scanner
+            .scan(network, &claimant, &rpc_client, &self.bam_boost_program_id)
+            .await?;
+
+        if self.print_json {
+            println!("{}", serde_json::to_string_pretty(&statuses)?);
+            return Ok(());
+        }
+
+        println!("{:>8}  {:>18}  Status", "Epoch", "Amount (JitoSOL)");
+        let mut unclaimed_total = 0u64;
+        let mut unclaimed_count = 0u64;
+        for s in &statuses {
+            let (amount, state) = match (s.amount, s.claimed) {
+                (Some(a), true) => (format_jitosol(a), "claimed"),
+                (Some(a), false) => {
+                    unclaimed_total = unclaimed_total.saturating_add(a);
+                    unclaimed_count += 1;
+                    (format_jitosol(a), "unclaimed")
+                }
+                (None, _) => ("-".to_string(), "not eligible"),
+            };
+            println!("{:>8}  {:>18}  {}", s.epoch, amount, state);
+        }
+        println!(
+            "\nUnclaimed: {unclaimed_count} epoch(s), {} JitoSOL",
+            format_jitosol(unclaimed_total)
+        );
+        Ok(())
+    }
+
     fn get_claim_status(&self, epoch: u64, claimant: Pubkey) -> anyhow::Result<()> {
         let distributor_pda =
             pda::merkle_distributor_address(&self.bam_boost_program_id, &JITOSOL_MINT, epoch);
@@ -238,5 +292,17 @@ impl BamBoostCliHandler {
         log::info!("Transaction confirmed: {:?}", result);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_jitosol_amounts() {
+        assert_eq!(format_jitosol(0), "0.000000000");
+        assert_eq!(format_jitosol(1_234), "0.000001234");
+        assert_eq!(format_jitosol(1_500_000_000), "1.500000000");
     }
 }
