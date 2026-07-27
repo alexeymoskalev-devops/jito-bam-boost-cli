@@ -75,6 +75,8 @@ scripting):
 
 ```bash
 cargo r -p jito-bam-boost-cli -- \
+    --rpc-url <RPC_URL> \
+    --commitment confirmed \
     bam-boost merkle-distributor status \
     --network mainnet \
     --claimant <IDENTITY_PUBKEY> \
