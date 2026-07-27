@@ -17,6 +17,15 @@ use crate::{
 // existing `bam_boost_handler::format_jitosol` imports keep compiling.
 pub use crate::scanner::format_jitosol;
 
+/// Formats a message about skipped expired epochs.
+fn format_expired_message(count: usize, total_amount: u64) -> String {
+    format!(
+        "Skipping {} expired epoch(s) ({} JitoSOL no longer claimable)",
+        count,
+        format_jitosol(total_amount)
+    )
+}
+
 pub fn default_cache_dir() -> std::path::PathBuf {
     dirs::cache_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -238,6 +247,16 @@ impl BamBoostCliHandler {
             .scan(network, &claimant, &rpc_client, &self.bam_boost_program_id)
             .await?;
 
+        // Print stats after scan
+        println!("{}", crate::scanner::Stats::from(&statuses[..]).format());
+
+        // Print message about skipped expired epochs if any exist
+        let expired: Vec<_> = statuses.iter().filter(|s| s.expired).collect();
+        if !expired.is_empty() {
+            let expired_amount: u64 = expired.iter().filter_map(|s| s.amount).sum();
+            println!("{}", format_expired_message(expired.len(), expired_amount));
+        }
+
         let unclaimed: Vec<_> = statuses.iter().filter(|s| s.is_claimable()).collect();
         if unclaimed.is_empty() {
             println!("Nothing to claim: no unclaimed epochs for {claimant}");
@@ -367,6 +386,18 @@ mod tests {
         assert_eq!(format_jitosol(0), "0.000000000");
         assert_eq!(format_jitosol(1_234), "0.000001234");
         assert_eq!(format_jitosol(1_500_000_000), "1.500000000");
+    }
+
+    #[test]
+    fn formats_expired_message() {
+        assert_eq!(
+            format_expired_message(1, 500_000_000),
+            "Skipping 1 expired epoch(s) (0.500000000 JitoSOL no longer claimable)"
+        );
+        assert_eq!(
+            format_expired_message(3, 3_500_000_000),
+            "Skipping 3 expired epoch(s) (3.500000000 JitoSOL no longer claimable)"
+        );
     }
 
     #[tokio::test]
