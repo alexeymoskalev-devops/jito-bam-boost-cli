@@ -13,10 +13,9 @@ use crate::{
     pda, JITOSOL_MINT,
 };
 
-pub fn format_jitosol(lamports: u64) -> String {
-    let base = 10u64.pow(jito_bam_boost_merkle_tree::tree_node::MINT_DECIMALS);
-    format!("{}.{:09}", lamports / base, lamports % base)
-}
+// `format_jitosol` lives in `scanner.rs` (single implementation); re-exported here so
+// existing `bam_boost_handler::format_jitosol` imports keep compiling.
+pub use crate::scanner::format_jitosol;
 
 pub fn default_cache_dir() -> std::path::PathBuf {
     dirs::cache_dir()
@@ -186,23 +185,18 @@ impl BamBoostCliHandler {
         }
 
         println!("{:>8}  {:>18}  Status", "Epoch", "Amount (JitoSOL)");
-        let mut unclaimed_total = 0u64;
-        let mut unclaimed_count = 0u64;
         for s in &statuses {
-            let (amount, state) = match (s.amount, s.claimed) {
-                (Some(a), true) => (format_jitosol(a), "claimed"),
-                (Some(a), false) => {
-                    unclaimed_total = unclaimed_total.saturating_add(a);
-                    unclaimed_count += 1;
-                    (format_jitosol(a), "unclaimed")
-                }
-                (None, _) => ("-".to_string(), "not eligible"),
+            let (amount, state) = match (s.amount, s.claimed, s.expired) {
+                (Some(a), true, _) => (format_jitosol(a), "claimed"),
+                (Some(a), false, true) => (format_jitosol(a), "expired"),
+                (Some(a), false, false) => (format_jitosol(a), "unclaimed"),
+                (None, _, _) => ("-".to_string(), "not eligible"),
             };
             println!("{:>8}  {:>18}  {}", s.epoch, amount, state);
         }
         println!(
-            "\nUnclaimed: {unclaimed_count} epoch(s), {} JitoSOL",
-            format_jitosol(unclaimed_total)
+            "\n{}",
+            crate::scanner::Stats::from(statuses.as_slice()).format()
         );
         Ok(())
     }

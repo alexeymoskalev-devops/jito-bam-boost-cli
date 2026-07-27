@@ -373,16 +373,19 @@ mod tests {
                 epoch: 1,
                 amount: Some(10),
                 claimed: false,
+                expired: false,
             },
             EpochStatus {
                 epoch: 2,
                 amount: Some(20),
                 claimed: true,
+                expired: false,
             },
             EpochStatus {
                 epoch: 3,
                 amount: None,
                 claimed: false,
+                expired: false,
             },
         ])));
         app

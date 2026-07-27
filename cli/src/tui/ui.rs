@@ -348,16 +348,19 @@ mod tests {
                 epoch: 1000,
                 amount: Some(1_500_000_000),
                 claimed: false,
+                expired: false,
             },
             EpochStatus {
                 epoch: 999,
                 amount: Some(1_000_000_000),
                 claimed: true,
+                expired: false,
             },
             EpochStatus {
                 epoch: 998,
                 amount: None,
                 claimed: false,
+                expired: false,
             },
         ];
 
@@ -392,6 +395,7 @@ mod tests {
             epoch: 1,
             amount: Some(10),
             claimed: false,
+            expired: false,
         }];
         app.selected = std::collections::HashSet::from([1]);
         app.setup_error = Some("keypair path is required".to_string());
@@ -413,6 +417,7 @@ mod tests {
                 epoch: 200 + i,
                 amount: Some(1_000_000_000),
                 claimed: false,
+                expired: false,
             })
             .collect();
         app.cursor = 25;
