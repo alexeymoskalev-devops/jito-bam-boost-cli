@@ -225,6 +225,12 @@ impl BamBoostCliHandler {
     }
 
     async fn claim_all(&self, network: &str, yes: bool) -> anyhow::Result<()> {
+        if self.print_tx {
+            anyhow::bail!(
+                "--print-tx is not supported by claim-all; use `status` to preview unclaimed epochs"
+            );
+        }
+
         let signer = self
             .cli_config
             .signer
@@ -367,5 +373,23 @@ mod tests {
         assert_eq!(format_jitosol(0), "0.000000000");
         assert_eq!(format_jitosol(1_234), "0.000001234");
         assert_eq!(format_jitosol(1_500_000_000), "1.500000000");
+    }
+
+    #[tokio::test]
+    async fn claim_all_rejects_print_tx() {
+        let cli_config = CliConfig {
+            rpc_url: "http://localhost:1".to_string(),
+            commitment: solana_commitment_config::CommitmentConfig::confirmed(),
+            signer: None,
+        };
+        let handler = BamBoostCliHandler::new(cli_config, Pubkey::new_unique(), true, false, false);
+
+        let err = handler
+            .claim_all("mainnet", true)
+            .await
+            .expect_err("claim-all must reject --print-tx");
+        assert!(err
+            .to_string()
+            .contains("--print-tx is not supported by claim-all"));
     }
 }
