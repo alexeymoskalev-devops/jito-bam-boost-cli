@@ -2653,6 +2653,7 @@ dependencies = [
  "hex",
  "indexmap 2.13.0",
  "jito-bam-boost-merkle-verify",
+ "log",
  "rand 0.8.5",
  "serde",
  "serde_json",
