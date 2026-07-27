@@ -11,7 +11,6 @@ const RETRY_BASE_DELAY_MS: u64 = 300;
 /// Discovers BAM Boost epochs, allocations, and claim statuses.
 pub struct Scanner {
     base_url: String,
-    #[allow(dead_code)]
     cache_dir: PathBuf,
     http: reqwest::Client,
 }
@@ -72,7 +71,15 @@ impl Scanner {
     ) -> anyhow::Result<Option<Vec<BamBoostEntry>>> {
         let cache_path = self.cache_dir.join(network).join(format!("{epoch}.json"));
         if let Ok(raw) = std::fs::read_to_string(&cache_path) {
-            return Ok(Some(serde_json::from_str(&raw)?));
+            match serde_json::from_str::<Vec<BamBoostEntry>>(&raw) {
+                Ok(entries) => return Ok(Some(entries)),
+                Err(e) => {
+                    log::warn!(
+                        "corrupted cache for {network}/{epoch}: {e}, deleting and re-fetching"
+                    );
+                    let _ = std::fs::remove_file(&cache_path);
+                }
+            }
         }
 
         let url = format!(
@@ -91,7 +98,10 @@ impl Scanner {
                         if let Some(parent) = cache_path.parent() {
                             std::fs::create_dir_all(parent)?;
                         }
-                        std::fs::write(&cache_path, &raw)?;
+                        // Atomic write: write to temp file, then rename
+                        let tmp_path = cache_path.with_extension("json.tmp");
+                        std::fs::write(&tmp_path, &raw)?;
+                        std::fs::rename(&tmp_path, &cache_path)?;
                         return Ok(Some(entries));
                     }
                     Err(e) if attempt < RETRY_ATTEMPTS => {
@@ -262,5 +272,32 @@ mod tests {
         let err = scanner.fetch_entries("mainnet", 9).await;
         assert!(err.is_err());
         failing.assert_hits(3); // 3 attempts total
+    }
+
+    #[tokio::test]
+    async fn recovers_from_corrupted_cache() {
+        let server = httpmock::MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method("GET")
+                .path("/jito-bam-boost/mainnet/10/merkle_tree.json");
+            then.status(200).json_body(entries_json());
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let scanner = Scanner::with_base_url(server.base_url(), tmp.path().to_path_buf());
+
+        // Write corrupted cache file
+        let cache_path = tmp.path().join("mainnet").join("10.json");
+        std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+        std::fs::write(&cache_path, "{invalid").unwrap();
+
+        // Fetch should recover from corrupted cache and fetch from network
+        let entries = scanner.fetch_entries("mainnet", 10).await.unwrap().unwrap();
+
+        // Verify entries were fetched and cache was healed
+        assert_eq!(entries[0].amount, 1234);
+        mock.assert_hits(1);
+        let cached = std::fs::read_to_string(&cache_path).unwrap();
+        let reparsed: Vec<BamBoostEntry> = serde_json::from_str(&cached).unwrap();
+        assert_eq!(reparsed, entries);
     }
 }
