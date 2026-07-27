@@ -1,5 +1,10 @@
+use crate::{pda, JITOSOL_MINT};
+use futures::stream::{self, StreamExt};
 use jito_bam_boost_merkle_tree::bam_boost_entry::BamBoostEntry;
 use serde::{Deserialize, Serialize};
+use solana_pubkey::Pubkey;
+use solana_rpc_client::rpc_client::RpcClient;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -121,6 +126,85 @@ impl Scanner {
     }
 }
 
+/// Finds the claimant's allocation in an epoch's entry list.
+pub fn amount_for(entries: &[BamBoostEntry], claimant: &Pubkey) -> Option<u64> {
+    let claimant = claimant.to_string();
+    entries
+        .iter()
+        .find(|e| e.pubkey == claimant)
+        .map(|e| e.amount)
+}
+
+/// Merges per-epoch amounts and claim flags into the final status list.
+pub fn combine(
+    epochs: &[u64],
+    amounts: &HashMap<u64, Option<u64>>,
+    claimed: &HashMap<u64, bool>,
+) -> Vec<EpochStatus> {
+    epochs
+        .iter()
+        .map(|&epoch| EpochStatus {
+            epoch,
+            amount: amounts.get(&epoch).copied().flatten(),
+            claimed: claimed.get(&epoch).copied().unwrap_or(false),
+        })
+        .collect()
+}
+
+const FETCH_CONCURRENCY: usize = 8;
+const RPC_BATCH: usize = 100;
+
+impl Scanner {
+    /// Full scan: which epochs exist, what the claimant is owed, what is claimed.
+    pub async fn scan(
+        &self,
+        network: &str,
+        claimant: &Pubkey,
+        rpc: &RpcClient,
+        program_id: &Pubkey,
+    ) -> anyhow::Result<Vec<EpochStatus>> {
+        let epochs = self.list_epochs(network).await?;
+
+        let scanner = self;
+        let amounts: HashMap<u64, Option<u64>> = stream::iter(epochs.clone())
+            .map(|epoch| async move {
+                let entries = scanner.fetch_entries(network, epoch).await?;
+                let amount = entries.as_deref().and_then(|e| amount_for(e, claimant));
+                Ok::<_, anyhow::Error>((epoch, amount))
+            })
+            .buffer_unordered(FETCH_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<_, _>>()?;
+
+        // Only epochs with an allocation need an on-chain check.
+        let eligible: Vec<u64> = epochs
+            .iter()
+            .copied()
+            .filter(|e| matches!(amounts.get(e), Some(Some(_))))
+            .collect();
+
+        let pdas: Vec<Pubkey> = eligible
+            .iter()
+            .map(|&epoch| {
+                let distributor = pda::merkle_distributor_address(program_id, &JITOSOL_MINT, epoch);
+                pda::claim_status_address(program_id, claimant, &distributor)
+            })
+            .collect();
+
+        let mut claimed = HashMap::new();
+        for (chunk_epochs, chunk_pdas) in eligible.chunks(RPC_BATCH).zip(pdas.chunks(RPC_BATCH)) {
+            let accounts = rpc.get_multiple_accounts(chunk_pdas)?;
+            for (&epoch, account) in chunk_epochs.iter().zip(accounts) {
+                claimed.insert(epoch, account.is_some());
+            }
+        }
+
+        Ok(combine(&epochs, &amounts, &claimed))
+    }
+}
+
 /// Status of one epoch's subsidy for a claimant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochStatus {
@@ -156,6 +240,47 @@ pub fn parse_epoch_from_object_name(name: &str, network: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn amount_for_finds_claimant_by_string_pubkey() {
+        use jito_bam_boost_merkle_tree::bam_boost_entry::BamBoostEntry;
+        let claimant = solana_pubkey::Pubkey::new_unique();
+        let entries = vec![
+            BamBoostEntry::new(solana_pubkey::Pubkey::new_unique().to_string(), 5),
+            BamBoostEntry::new(claimant.to_string(), 42),
+        ];
+        assert_eq!(amount_for(&entries, &claimant), Some(42));
+        assert_eq!(amount_for(&entries[..1], &claimant), None);
+    }
+
+    #[test]
+    fn combine_builds_epoch_statuses_in_order() {
+        use std::collections::HashMap;
+        let epochs = vec![1, 2, 3];
+        let amounts: HashMap<u64, Option<u64>> = [(1, Some(10)), (2, None), (3, Some(30))].into();
+        let claimed: HashMap<u64, bool> = [(1, true), (3, false)].into();
+        let out = combine(&epochs, &amounts, &claimed);
+        assert_eq!(
+            out,
+            vec![
+                EpochStatus {
+                    epoch: 1,
+                    amount: Some(10),
+                    claimed: true
+                },
+                EpochStatus {
+                    epoch: 2,
+                    amount: None,
+                    claimed: false
+                },
+                EpochStatus {
+                    epoch: 3,
+                    amount: Some(30),
+                    claimed: false
+                },
+            ]
+        );
+    }
 
     #[test]
     fn parses_epoch_from_object_name() {
