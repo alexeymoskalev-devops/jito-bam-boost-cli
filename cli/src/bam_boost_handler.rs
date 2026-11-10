@@ -188,15 +188,22 @@ impl BamBoostCliHandler {
         println!("{:>8}  {:>18}  Status", "Epoch", "Amount (JitoSOL)");
         let mut unclaimed_total = 0u64;
         let mut unclaimed_count = 0u64;
+        let mut expired_total = 0u64;
+        let mut expired_count = 0u64;
         for s in &statuses {
-            let (amount, state) = match (s.amount, s.claimed) {
-                (Some(a), true) => (format_jitosol(a), "claimed"),
-                (Some(a), false) => {
+            let (amount, state) = match (s.amount, s.claimed, s.expired) {
+                (Some(a), true, _) => (format_jitosol(a), "claimed"),
+                (Some(a), false, true) => {
+                    expired_total = expired_total.saturating_add(a);
+                    expired_count += 1;
+                    (format_jitosol(a), "expired")
+                }
+                (Some(a), false, false) => {
                     unclaimed_total = unclaimed_total.saturating_add(a);
                     unclaimed_count += 1;
                     (format_jitosol(a), "unclaimed")
                 }
-                (None, _) => ("-".to_string(), "not eligible"),
+                (None, _, _) => ("-".to_string(), "not eligible"),
             };
             println!("{:>8}  {:>18}  {}", s.epoch, amount, state);
         }
@@ -204,6 +211,12 @@ impl BamBoostCliHandler {
             "\nUnclaimed: {unclaimed_count} epoch(s), {} JitoSOL",
             format_jitosol(unclaimed_total)
         );
+        if expired_count > 0 {
+            println!(
+                "Expired:   {expired_count} epoch(s), {} JitoSOL (claim window closed, not claimable)",
+                format_jitosol(expired_total)
+            );
+        }
         Ok(())
     }
 
