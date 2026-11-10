@@ -373,16 +373,25 @@ mod tests {
                 epoch: 1,
                 amount: Some(10),
                 claimed: false,
+                expired: false,
             },
             EpochStatus {
                 epoch: 2,
                 amount: Some(20),
                 claimed: true,
+                expired: false,
             },
             EpochStatus {
                 epoch: 3,
                 amount: None,
                 claimed: false,
+                expired: false,
+            },
+            EpochStatus {
+                epoch: 4,
+                amount: Some(40),
+                claimed: false,
+                expired: true,
             },
         ])));
         app
@@ -392,7 +401,7 @@ mod tests {
     fn setup_enter_on_start_triggers_scan_and_moves_to_dashboard() {
         let app = scanned_app();
         assert!(matches!(app.screen, Screen::Dashboard));
-        assert_eq!(app.statuses.len(), 3);
+        assert_eq!(app.statuses.len(), 4);
         assert!(!app.scanning);
     }
 

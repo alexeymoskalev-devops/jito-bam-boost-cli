@@ -4,7 +4,7 @@ use jito_bam_boost_merkle_tree::bam_boost_entry::BamBoostEntry;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
 use solana_rpc_client::rpc_client::RpcClient;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -135,11 +135,12 @@ pub fn amount_for(entries: &[BamBoostEntry], claimant: &Pubkey) -> Option<u64> {
         .map(|e| e.amount)
 }
 
-/// Merges per-epoch amounts and claim flags into the final status list.
+/// Merges per-epoch amounts, claim flags and expiry into the final status list.
 pub fn combine(
     epochs: &[u64],
     amounts: &HashMap<u64, Option<u64>>,
     claimed: &HashMap<u64, bool>,
+    expired: &HashSet<u64>,
 ) -> Vec<EpochStatus> {
     epochs
         .iter()
@@ -147,8 +148,56 @@ pub fn combine(
             epoch,
             amount: amounts.get(&epoch).copied().flatten(),
             claimed: claimed.get(&epoch).copied().unwrap_or(false),
+            expired: expired.contains(&epoch),
         })
         .collect()
+}
+
+/// Claim window of an epoch's MerkleDistributor account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimWindow {
+    pub epoch: u64,
+    /// Epoch from which unclaimed funds may be clawed back.
+    pub clawback_start_epoch: u64,
+    /// Unclaimed funds were already clawed back (claims fail with `ClaimExpired`).
+    pub clawed_back: bool,
+}
+
+impl ClaimWindow {
+    /// Conservative: whether claims are still accepted during `clawback_start_epoch`
+    /// itself is unconfirmed, so that epoch counts as open unless clawback already
+    /// happened. Worst case is a claim attempt that fails, never a hidden allocation.
+    pub fn is_expired(&self, current_epoch: u64) -> bool {
+        self.clawed_back || current_epoch > self.clawback_start_epoch
+    }
+}
+
+// MerkleDistributor layout, decoded from mainnet accounts (the program source is
+// not public): discriminator(8) bump(1) root(32) mint(32), then u64 LE fields
+// max_total_claim, max_num_nodes, total_amount_claimed, num_nodes_claimed,
+// epoch, end_epoch, clawback_start_epoch, then clawback_receiver(32), clawed_back(1).
+const DISTRIBUTOR_DISCRIMINATOR: [u8; 8] = [0x4d, 0x77, 0x8b, 0x46, 0x54, 0xf7, 0x0c, 0x1a];
+const EPOCH_OFFSET: usize = 8 + 1 + 32 + 32 + 4 * 8;
+const CLAWBACK_START_OFFSET: usize = EPOCH_OFFSET + 2 * 8;
+const CLAWED_BACK_OFFSET: usize = CLAWBACK_START_OFFSET + 8 + 32;
+
+/// Decodes the claim window from raw MerkleDistributor account data.
+/// Returns `None` if the data is not a MerkleDistributor of the known layout.
+pub fn parse_claim_window(data: &[u8]) -> Option<ClaimWindow> {
+    if data.len() <= CLAWED_BACK_OFFSET || data[..8] != DISTRIBUTOR_DISCRIMINATOR {
+        return None;
+    }
+    let read_u64 = |offset: usize| u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap());
+    let clawed_back = match data[CLAWED_BACK_OFFSET] {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    Some(ClaimWindow {
+        epoch: read_u64(EPOCH_OFFSET),
+        clawback_start_epoch: read_u64(CLAWBACK_START_OFFSET),
+        clawed_back,
+    })
 }
 
 const FETCH_CONCURRENCY: usize = 8;
@@ -201,8 +250,60 @@ impl Scanner {
             }
         }
 
-        Ok(combine(&epochs, &amounts, &claimed))
+        let unclaimed: Vec<u64> = eligible
+            .iter()
+            .copied()
+            .filter(|e| !claimed.get(e).copied().unwrap_or(false))
+            .collect();
+        // Expiry is advisory: if it cannot be determined, keep epochs claimable
+        // rather than failing the whole scan.
+        let expired = expired_epochs(&unclaimed, rpc, program_id).unwrap_or_else(|e| {
+            log::warn!("could not determine claim window expiry: {e}");
+            HashSet::new()
+        });
+
+        Ok(combine(&epochs, &amounts, &claimed, &expired))
     }
+}
+
+/// Returns the epochs (out of `epochs`) whose claim window has closed.
+/// An epoch whose distributor cannot be read or decoded is logged and treated
+/// as open, so a layout change never hides a claimable allocation.
+fn expired_epochs(
+    epochs: &[u64],
+    rpc: &RpcClient,
+    program_id: &Pubkey,
+) -> anyhow::Result<HashSet<u64>> {
+    let mut expired = HashSet::new();
+    if epochs.is_empty() {
+        return Ok(expired);
+    }
+    let current_epoch = rpc.get_epoch_info()?.epoch;
+    let distributors: Vec<Pubkey> = epochs
+        .iter()
+        .map(|&epoch| pda::merkle_distributor_address(program_id, &JITOSOL_MINT, epoch))
+        .collect();
+    for (chunk_epochs, chunk_pdas) in epochs.chunks(RPC_BATCH).zip(distributors.chunks(RPC_BATCH)) {
+        let accounts = rpc.get_multiple_accounts(chunk_pdas)?;
+        for (&epoch, account) in chunk_epochs.iter().zip(accounts) {
+            let Some(account) = account else {
+                log::warn!("epoch {epoch}: distributor account not found, expiry unknown");
+                continue;
+            };
+            match parse_claim_window(&account.data) {
+                Some(window) if window.epoch != epoch => log::warn!(
+                    "epoch {epoch}: distributor reports epoch {}, expiry unknown",
+                    window.epoch
+                ),
+                Some(window) if window.is_expired(current_epoch) => {
+                    expired.insert(epoch);
+                }
+                Some(_) => {}
+                None => log::warn!("epoch {epoch}: unexpected distributor layout, expiry unknown"),
+            }
+        }
+    }
+    Ok(expired)
 }
 
 /// Status of one epoch's subsidy for a claimant.
@@ -212,12 +313,15 @@ pub struct EpochStatus {
     /// Allocation in JitoSOL lamports; `None` = claimant not in that epoch's tree.
     pub amount: Option<u64>,
     pub claimed: bool,
+    /// Unclaimed allocation whose claim window has closed.
+    #[serde(default)]
+    pub expired: bool,
 }
 
 impl EpochStatus {
-    /// Whether this epoch has an unclaimed allocation for the claimant.
+    /// Whether this epoch has an unclaimed allocation that can still be claimed.
     pub fn is_claimable(&self) -> bool {
-        self.amount.is_some() && !self.claimed
+        self.amount.is_some() && !self.claimed && !self.expired
     }
 }
 
@@ -262,31 +366,109 @@ mod tests {
 
     #[test]
     fn combine_builds_epoch_statuses_in_order() {
-        use std::collections::HashMap;
-        let epochs = vec![1, 2, 3];
-        let amounts: HashMap<u64, Option<u64>> = [(1, Some(10)), (2, None), (3, Some(30))].into();
-        let claimed: HashMap<u64, bool> = [(1, true), (3, false)].into();
-        let out = combine(&epochs, &amounts, &claimed);
+        use std::collections::{HashMap, HashSet};
+        let epochs = vec![1, 2, 3, 4];
+        let amounts: HashMap<u64, Option<u64>> =
+            [(1, Some(10)), (2, None), (3, Some(30)), (4, Some(40))].into();
+        let claimed: HashMap<u64, bool> = [(1, true), (3, false), (4, false)].into();
+        let expired: HashSet<u64> = [4].into();
+        let out = combine(&epochs, &amounts, &claimed, &expired);
         assert_eq!(
             out,
             vec![
                 EpochStatus {
                     epoch: 1,
                     amount: Some(10),
-                    claimed: true
+                    claimed: true,
+                    expired: false,
                 },
                 EpochStatus {
                     epoch: 2,
                     amount: None,
-                    claimed: false
+                    claimed: false,
+                    expired: false,
                 },
                 EpochStatus {
                     epoch: 3,
                     amount: Some(30),
-                    claimed: false
+                    claimed: false,
+                    expired: false,
+                },
+                EpochStatus {
+                    epoch: 4,
+                    amount: Some(40),
+                    claimed: false,
+                    expired: true,
                 },
             ]
         );
+        assert!(out[2].is_claimable());
+        assert!(
+            !out[3].is_claimable(),
+            "expired epoch must not be claimable"
+        );
+    }
+
+    // Raw mainnet MerkleDistributor accounts (fetched 2026-11-09, current epoch 1082).
+    const DISTRIBUTOR_931_HEX: &str = "4d778b4654f70c1aff2872092f678907dc13997196080f67d9e36f6f3cb7a5ca6aea62d87753a58e6ffcd141e9832caf10ad917495ca0f271b5b293cd47027ea737007ed40eb39a0bd5e67ca8b830000002901000000000000742e9e0274000000f600000000000000a303000000000000ac03000000000000ad03000000000000768f28a3a3b2fb52f35a58a7e58b595c44c778ed012cf71aa6f9c236700c6427017fe91e5d11000000ccfced2411000000000000000000";
+    const DISTRIBUTOR_1081_HEX: &str = "4d778b4654f70c1aff70f92d5e40de705f2914e656a2192745443121c6da3d10972c380e613ae649bafcd141e9832caf10ad917495ca0f271b5b293cd47027ea737007ed40eb39a0bd2cee2db22800000068010000000000000e12803c11000000940000000000000039040000000000004c040000000000004d04000000000000768f28a3a3b2fb52f35a58a7e58b595c44c778ed012cf71aa6f9c236700c642700b0244aeb0500000089efd36803000000000000000000";
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn parses_claim_window_from_distributor_account() {
+        let w931 = parse_claim_window(&hex(DISTRIBUTOR_931_HEX)).unwrap();
+        assert_eq!(
+            w931,
+            ClaimWindow {
+                epoch: 931,
+                clawback_start_epoch: 941,
+                clawed_back: true
+            }
+        );
+        let w1081 = parse_claim_window(&hex(DISTRIBUTOR_1081_HEX)).unwrap();
+        assert_eq!(
+            w1081,
+            ClaimWindow {
+                epoch: 1081,
+                clawback_start_epoch: 1101,
+                clawed_back: false
+            }
+        );
+    }
+
+    #[test]
+    fn claim_window_expiry() {
+        let open = ClaimWindow {
+            epoch: 1081,
+            clawback_start_epoch: 1101,
+            clawed_back: false,
+        };
+        assert!(!open.is_expired(1082));
+        assert!(!open.is_expired(1100));
+        assert!(
+            !open.is_expired(1101),
+            "clawback start epoch itself counts as open"
+        );
+        assert!(open.is_expired(1102));
+        let clawed = ClaimWindow {
+            clawed_back: true,
+            ..open
+        };
+        assert!(clawed.is_expired(1082));
+    }
+
+    #[test]
+    fn rejects_foreign_or_short_account_data() {
+        let mut data = hex(DISTRIBUTOR_931_HEX);
+        assert!(parse_claim_window(&data[..100]).is_none());
+        data[0] ^= 0xff;
+        assert!(parse_claim_window(&data).is_none());
     }
 
     #[test]

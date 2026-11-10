@@ -115,6 +115,8 @@ fn status_str(status: &EpochStatus) -> &'static str {
         "not eligible"
     } else if status.claimed {
         "claimed"
+    } else if status.expired {
+        "expired"
     } else {
         "unclaimed"
     }
@@ -347,16 +349,25 @@ mod tests {
                 epoch: 1000,
                 amount: Some(1_500_000_000),
                 claimed: false,
+                expired: false,
             },
             EpochStatus {
                 epoch: 999,
                 amount: Some(1_000_000_000),
                 claimed: true,
+                expired: false,
             },
             EpochStatus {
                 epoch: 998,
                 amount: None,
                 claimed: false,
+                expired: false,
+            },
+            EpochStatus {
+                epoch: 931,
+                amount: Some(592_102_337),
+                claimed: false,
+                expired: true,
             },
         ];
 
@@ -368,7 +379,10 @@ mod tests {
         assert!(text.contains("unclaimed"));
         assert!(text.contains("claimed"));
         assert!(text.contains("not eligible"));
+        assert!(text.contains("expired"));
         assert!(text.contains("1.500000000")); // formatted JitoSOL
+                                               // expired allocations are not counted as claimable
+        assert!(text.contains("Unclaimed: 1 epochs, 1.500000000 JitoSOL"));
     }
 
     #[test]
@@ -391,6 +405,7 @@ mod tests {
             epoch: 1,
             amount: Some(10),
             claimed: false,
+            expired: false,
         }];
         app.selected = std::collections::HashSet::from([1]);
         app.setup_error = Some("keypair path is required".to_string());
